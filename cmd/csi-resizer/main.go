@@ -20,8 +20,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/component-base/metrics/legacyregistry"
+	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
+	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,7 +156,23 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	metricsManager := metrics.NewCSIMetricsManager("" /* driverName */)
+	metricsManager := metrics.NewCSIMetricsManagerWithOptions("", /* driverName */
+		// Will be provided via default gatherer.
+		metrics.WithProcessStartTime(false),
+		metrics.WithSubsystem(metrics.SubsystemSidecar),
+	)
+
+	gatherers := prometheus.Gatherers{
+		// For workqueue and leader election metrics, set up via the anonymous imports of:
+		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/workqueue/metrics.go
+		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/clientgo/leaderelection/metrics.go
+		//
+		// Also to happens to include Go runtime and process metrics:
+		// https://github.com/kubernetes/kubernetes/blob/9780d88cb6a4b5b067256ecb4abf56892093ee87/staging/src/k8s.io/component-base/metrics/legacyregistry/registry.go#L46-L49
+		legacyregistry.DefaultGatherer,
+		// For CSI operations.
+		metricsManager.GetRegistry(),
+	}
 
 	ctx := context.Background()
 	csiClient, err := csi.New(ctx, *csiAddress, *timeout, metricsManager)
@@ -201,8 +224,12 @@ func main() {
 
 	// Start HTTP server for metrics + leader election healthz
 	if addr != "" {
-		metricsManager.RegisterToServer(mux, *metricsPath)
-		metricsManager.SetDriverName(driverName)
+		reg := prometheus.NewRegistry()
+		gatherers = append(gatherers, reg)
+		mux.Handle(*metricsPath,
+			promhttp.InstrumentMetricHandler(
+				reg,
+				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
 		go func() {
 			klog.InfoS("ServeMux listening", "address", addr)
 			err := http.ListenAndServe(addr, mux)
@@ -235,6 +262,10 @@ func main() {
 		<-ctx.Done()
 	}
 
+	// Generate a unique ID for this resizer
+	timeStamp := time.Now().UnixNano() / int64(time.Millisecond)
+	identity := strconv.FormatInt(timeStamp, 10) + "-" + strconv.Itoa(rand.Intn(10000)) + "-" + "resizer"
+
 	if !*enableLeaderElection {
 		run(ctx)
 	} else {
@@ -256,6 +287,7 @@ func main() {
 		le.WithLeaseDuration(*leaderElectionLeaseDuration)
 		le.WithRenewDeadline(*leaderElectionRenewDeadline)
 		le.WithRetryPeriod(*leaderElectionRetryPeriod)
+		le.WithIdentity(identity)
 
 		if err := le.Run(); err != nil {
 			klog.ErrorS(err, "Error initializing leader election")
